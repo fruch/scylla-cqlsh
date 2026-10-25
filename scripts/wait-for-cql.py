@@ -7,11 +7,13 @@ import sys
 import time
 
 from cassandra.cluster import Cluster, NoHostAvailable
+# the driver's default libev reactor crashes on Windows; asyncio works everywhere
+from cassandra.io.asyncioreactor import AsyncioConnection
 
 host = sys.argv[1] if len(sys.argv) > 1 else '127.0.0.1'
 deadline = time.time() + 600
 while True:
-    cluster = Cluster([host])
+    cluster = Cluster([host], connection_class=AsyncioConnection)
     try:
         print(cluster.connect().execute('SELECT release_version FROM system.local').one())
         break

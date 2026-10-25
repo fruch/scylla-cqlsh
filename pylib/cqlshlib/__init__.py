@@ -17,6 +17,15 @@
 from cassandra.metadata import RegisteredTableExtension
 import io
 import struct
+import sys
+
+if sys.platform == 'win32':
+    # The driver defaults to its libev reactor when the extension is built, and on Windows
+    # that crashes the interpreter (0xC0000409) on the first connect. Use asyncio instead,
+    # for every Cluster cqlsh, COPY and the tests create.
+    import cassandra.cluster
+    from cassandra.io.asyncioreactor import AsyncioConnection
+    cassandra.cluster.DefaultConnection = cassandra.cluster.Cluster.connection_class = AsyncioConnection
 
 
 # Add a handler for schema extensions to at least print 
