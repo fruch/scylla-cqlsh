@@ -208,7 +208,7 @@ jobs:
         shell: pwsh
         run: |
           wsl -d Ubuntu-24.04 -u root -- bash -euxc "curl -fsSL https://get.docker.com | sh; service docker start || true; sysctl -w fs.aio-max-nr=1048576"
-          wsl -d Ubuntu-24.04 -u root -- docker run -d --name scylla -p 9042:9042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 2 --memory 2G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
+          wsl -d Ubuntu-24.04 -u root -- docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 2 --memory 2G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
 
       - name: pytest
         shell: bash
@@ -247,7 +247,7 @@ jobs:
 
       - name: Start Scylla
         run: |
-          docker run -d --name scylla -p 9042:9042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 1 --memory 1G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
+          docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 1 --memory 1G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
 
       - name: pytest
         env:
