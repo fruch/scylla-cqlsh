@@ -28,14 +28,14 @@ jobs:
           pip install -r ./pylib/requirements.txt
           Get-Command python | Format-List Source
           pip show scylla-driver
-          function Try($code) {
+          function Probe($code) {
             python -X faulthandler -u -c $code
-            "exit code: $LASTEXITCODE (0x{0:X})" -f $LASTEXITCODE
+            'exit code: {0} (0x{0:X})' -f $LASTEXITCODE
           }
-          Try "import cassandra; print(cassandra.__file__)"
-          Try "import cassandra.cluster as c; print('cluster ok', c.Cluster.connection_class)"
-          Try "import socket; socket.create_connection(('127.0.0.1', 9042), timeout=5).close(); print('tcp ok')"
+          Probe "import cassandra; print(cassandra.__file__)"
+          Probe "import cassandra.cluster as c; print('cluster ok', c.Cluster.connection_class)"
+          Probe "import socket; socket.create_connection(('127.0.0.1', 9042), timeout=5).close(); print('tcp ok')"
           Start-Sleep 90
-          Try "import logging,sys; logging.basicConfig(level=logging.DEBUG, stream=sys.stdout); from cassandra.cluster import Cluster; print(Cluster(['127.0.0.1']).connect().execute('select release_version from system.local').one())"
-          Try "import logging,sys; logging.basicConfig(level=logging.DEBUG, stream=sys.stdout); from cassandra.cluster import Cluster; from cassandra.io.asyncioreactor import AsyncioConnection; print(Cluster(['127.0.0.1'], connection_class=AsyncioConnection).connect().execute('select release_version from system.local').one())"
+          Probe "import logging,sys; logging.basicConfig(level=logging.DEBUG, stream=sys.stdout); from cassandra.cluster import Cluster; print(Cluster(['127.0.0.1']).connect().execute('select release_version from system.local').one())"
+          Probe "import logging,sys; logging.basicConfig(level=logging.DEBUG, stream=sys.stdout); from cassandra.cluster import Cluster; from cassandra.io.asyncioreactor import AsyncioConnection; print(Cluster(['127.0.0.1'], connection_class=AsyncioConnection).connect().execute('select release_version from system.local').one())"
           Get-WinEvent -LogName Application -MaxEvents 20 | Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting' } | Format-List TimeCreated, Message
