@@ -5,29 +5,95 @@ on:
     branches:
      - master
   push:
+    tags:
+      - '*'
     branches:
       - master
 
+permissions:
+  contents: read
+
 env:
-  CIBW_SKIP: cp36*
+  CIBW_SKIP: cp36* cp37* cp38* cp39* pp*
+  # build cp315 wheels while 3.15 is still a release candidate; no-op once it's final
+  CIBW_ENABLE: cpython-prerelease
+  # smoke-test every built wheel, so a wheel that can't even import (e.g. on Windows) fails the build
+  CIBW_TEST_COMMAND: python -c "import cqlshlib.copyutil" && cqlsh --version
+  # Test modules that need a live cluster; the unit test job runs everything else.
+  PYTEST_IGNORE_CLUSTER_TESTS: >-
+    --ignore=./cqlshlib/test/test_copy_data.py
+    --ignore=./cqlshlib/test/test_copy_options.py
+    --ignore=./cqlshlib/test/test_copy_round_trip.py
+    --ignore=./cqlshlib/test/test_cqlsh_completion.py
+    --ignore=./cqlshlib/test/test_cqlsh_output.py
+    --ignore=./cqlshlib/test/test_cqlsh_shell.py
+    --ignore=./cqlshlib/test/test_escape_sequences.py
+    --ignore=./cqlshlib/test/test_formatting.py
+    --ignore=./cqlshlib/test/test_proxy_access.py
+    --ignore=./cqlshlib/test/test_unicode.py
+  # Pinned so a PR's integration result depends on the PR, not on when it ran;
+  # Renovate bumps them in their own PRs.
+  # renovate: datasource=docker depName=scylladb/scylla
+  SCYLLA_VERSION: 2026.3.4
+  # renovate: datasource=docker depName=cassandra
+  CASSANDRA_VERSION: 5.0.9
 
 jobs:
+  unit_tests:
+    name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        include:
+          # oldest and newest interpreters we claim to support
+          - {os: windows-latest, python-version: '3.10'}
+          - {os: windows-latest, python-version: '3.15'}
+          - {os: macos-latest, python-version: '3.10'}
+          - {os: macos-latest, python-version: '3.15'}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: pytest
+        env:
+          # nothing builds the package here, so cqlsh.py falls back to setuptools_scm,
+          # which has no tags to work with in a shallow checkout
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: |
+          export UV_HTTP_TIMEOUT=120
+          uv pip install --system -r ./pylib/requirements.txt setuptools_scm
+          pytest ./cqlshlib/test ${{ env.PYTEST_IGNORE_CLUSTER_TESTS }}
+
   build_wheels:
     name: Build wheels (${{ matrix.os }})
     if: contains(github.event.pull_request.labels.*.name, 'test-build') || github.event_name == 'push' && endsWith(github.event.ref, 'scylla')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-20.04, windows-2019, macos-11]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-14, macos-15-intel]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.9.0
+        uses: pypa/cibuildwheel@b9e566a2b284570af229f6c2a33673410d0389a3 # v4.3.4
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          name: artifacts-wheels-${{ matrix.os }}
           path: ./wheelhouse/*.whl
 
   build_sdist:
@@ -35,26 +101,43 @@ jobs:
     if: contains(github.event.pull_request.labels.*.name, 'test-build') || github.event_name == 'push' && endsWith(github.event.ref, 'scylla')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build sdist
         run: |
           pipx run build --sdist
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          name: artifacts-source-dist
           path: dist/*.tar.gz
 
   integration_test_scylla:
-    name: Integration Tests (Scylla)
+    name: Integration Tests (Scylla, Python ${{ matrix.python-version }})
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-test')"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # oldest and newest interpreters we claim to support
+        python-version: ['3.10', '3.15']
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # not uv's interpreter: python-build-standalone links libedit instead of
+      # GNU readline, and the pty-driven completion tests assert on readline's
+      # exact cursor movements
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Start Scylla
         run: |
-          export DOCKER_ID=$(docker run -d scylladb/scylla:latest --cluster-name test )
-          export CQL_TEST_HOST=$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' ${DOCKER_ID})
+          export DOCKER_ID=$(docker run -d scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test )
+          export CQL_TEST_HOST=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${DOCKER_ID})
           while ! nc -z ${CQL_TEST_HOST} 9042; do   
             sleep 0.1 # wait for 1/10 of the second before check again
           done
@@ -63,19 +146,24 @@ jobs:
 
       - name: pytest
         run: |
-          pip install -r ./pylib/requirements.txt
+          export PIP_RETRIES=10
+          export UV_HTTP_TIMEOUT=120
+          uv pip install --system -r ./pylib/requirements.txt
+          ./reloc/build_reloc.sh
           pytest ./cqlshlib/test
+          ./scripts/run-proxy-access-test.sh
 
   integration_test_cassandra:
     name: Integration Tests (Cassandra)
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-test')"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Start Scylla
         run: |
-          export DOCKER_ID=$(docker run -d -e CASSANDRA_CLUSTER_NAME=test cassandra:4.1 )
-          export CQL_TEST_HOST=$(docker inspect --format='{{ .NetworkSettings.IPAddress }}' ${DOCKER_ID})
+          export DOCKER_ID=$(docker run -d -e CASSANDRA_CLUSTER_NAME=test cassandra:${{ env.CASSANDRA_VERSION }} )
+          export CQL_TEST_HOST=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${DOCKER_ID})
           while ! nc -z ${CQL_TEST_HOST} 9042; do
                   sleep 0.1 # wait for 1/10 of the second before check again
           done
@@ -84,23 +172,164 @@ jobs:
 
       - name: pytest
         run: |
+          export PIP_RETRIES=10
           pip install -r ./pylib/requirements.txt
+           ./reloc/build_reloc.sh
           pytest ./cqlshlib/test
 
+  # GitHub's Windows runners only run Windows containers, so Scylla runs in Docker inside WSL2
+  # and the tests run on the Windows side, reaching it through WSL's localhost forwarding.
+  integration_test_scylla_windows:
+    name: Integration Tests (Scylla in WSL2, Windows)
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-test')"
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install WSL2 Ubuntu
+        shell: pwsh
+        run: |
+          wsl --version
+          wsl --set-default-version 2
+          wsl --install -d Ubuntu-24.04 --no-launch
+          wsl -d Ubuntu-24.04 -u root -- uname -a
+          wsl -l -v
+          # WSL shuts the VM down (and Scylla with it) once no wsl.exe is attached; keep one around
+          Start-Process -WindowStyle Hidden wsl -ArgumentList '-d','Ubuntu-24.04','-u','root','--','sleep','infinity'
+
+      - name: Start Scylla
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu-24.04 -u root -- bash -euxc "curl -fsSL https://get.docker.com | sh; service docker start || true; sysctl -w fs.aio-max-nr=1048576"
+          wsl -d Ubuntu-24.04 -u root -- docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 2 --memory 2G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
+
+      - name: pytest
+        shell: bash
+        env:
+          CQL_TEST_HOST: 127.0.0.1
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: |
+          export UV_HTTP_TIMEOUT=120
+          uv pip install --system -r ./pylib/requirements.txt setuptools_scm
+          python ./scripts/wait-for-cql.py 127.0.0.1
+          # test_proxy_access needs iptables and a docker proxy container on the test host
+          python -X faulthandler -m pytest -v ./cqlshlib/test --ignore=./cqlshlib/test/test_proxy_access.py
+
+      - name: Scylla logs
+        if: failure()
+        shell: pwsh
+        run: wsl -d Ubuntu-24.04 -u root -- docker logs scylla
+
+  # Docker on macOS runners needs a VM (colima); Apple silicon runners don't allow nested
+  # virtualization, so this has to be an Intel runner.
+  integration_test_scylla_macos:
+    name: Integration Tests (Scylla in colima, macOS)
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-test')"
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - uses: douglascamata/setup-docker-macos-action@d5ccc6aae0ce23e7700154f5e63cc53e6433ac48 # v1.1.0
+
+      - name: Start Scylla
+        run: |
+          docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 2 --memory 2G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
+
+      - name: pytest
+        env:
+          CQL_TEST_HOST: 127.0.0.1
+          # reloc/build_reloc.sh is Linux-only, so nothing builds the package here
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: |
+          export UV_HTTP_TIMEOUT=120
+          uv pip install --system -r ./pylib/requirements.txt setuptools_scm
+          python ./scripts/wait-for-cql.py 127.0.0.1
+          # test_proxy_access needs iptables on the test host
+          pytest ./cqlshlib/test --ignore=./cqlshlib/test/test_proxy_access.py
+
+      - name: Scylla logs
+        if: failure()
+        run: docker logs scylla
+
+  docker:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: determine docker tag base on tag
+        if: endsWith(github.event.ref, '-scylla')
+        shell: bash
+        run: |
+          split=(${GITHUB_REF_NAME//-/ })
+          DOCKER_TAG=${split[0]}
+          echo DOCKER_TAG=$DOCKER_TAG >> $GITHUB_ENV
+
+      - name: Build and push release
+        if: endsWith(github.event.ref, '-scylla')
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            scylladb/scylla-cqlsh:${{ env.DOCKER_TAG }}
+            scylladb/scylla-cqlsh:latest
+
+      - name: Build and push master
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: endsWith(github.event.ref, 'master')
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile
+          push: true
+          tags: |
+            scylladb/scylla-cqlsh:master
+
   upload_pypi:
-    needs: [build_wheels, build_sdist, integration_test_scylla, integration_test_cassandra]
+    needs: [unit_tests, build_wheels, build_sdist, integration_test_scylla, integration_test_cassandra]
     runs-on: ubuntu-latest
     # upload to PyPI on every tag starting with 'v'
     if: github.event_name == 'push' && endsWith(github.event.ref, 'scylla')
     # alternatively, to publish when a GitHub Release is created, use the following rule:
     # if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@v2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: artifact
           path: dist
+          pattern: artifacts-*
+          merge-multiple: true
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}

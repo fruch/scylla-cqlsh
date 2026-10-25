@@ -36,8 +36,8 @@ class UnexpectedTableStructure(UserWarning):
 
 
 SYSTEM_KEYSPACES = ('system', 'system_schema', 'system_traces', 'system_auth', 'system_distributed', 'system_views',
-                    'system_virtual_schema', 'system_distributed_everywhere')
-NONALTERBALE_KEYSPACES = ('system', 'system_schema', 'system_views', 'system_virtual_schema', 'system_distributed_everywhere')
+                    'system_virtual_schema', 'system_distributed_everywhere', 'system_replicated_keys')
+NONALTERBALE_KEYSPACES = ('system', 'system_schema', 'system_views', 'system_virtual_schema', 'system_distributed_everywhere', 'system_replicated_keys')
 
 
 class Cql3ParsingRuleSet(CqlParsingRuleSet):
@@ -138,12 +138,72 @@ class Cql3ParsingRuleSet(CqlParsingRuleSet):
             return name.lower()
 
     @staticmethod
-    def dequote_value(cqlword):
+    def decode_escape_sequences(s):
+        """
+        Decode escape sequences in a string.
+        Supports:
+        - \\xHH for hex values (e.g., \\x01 for byte 0x01)
+        - \\n for newline
+        - \\r for carriage return
+        - \\t for tab
+        - \\' for single quote
+        - \\\\ for backslash
+        """
+        if '\\' not in s:
+            return s
+        
+        result = []
+        i = 0
+        while i < len(s):
+            if s[i] == '\\' and i + 1 < len(s):
+                next_char = s[i + 1]
+                if next_char == 'x' and i + 4 <= len(s):
+                    # Handle hex escape sequence \xHH (need 4 chars total: \xHH)
+                    hex_digits = s[i + 2:i + 4]
+                    try:
+                        byte_val = int(hex_digits, 16)
+                        result.append(chr(byte_val))
+                        i += 4
+                        continue
+                    except (ValueError, OverflowError):
+                        # Not a valid hex sequence, treat as literal
+                        pass
+                elif next_char == 'n':
+                    result.append('\n')
+                    i += 2
+                    continue
+                elif next_char == 'r':
+                    result.append('\r')
+                    i += 2
+                    continue
+                elif next_char == 't':
+                    result.append('\t')
+                    i += 2
+                    continue
+                elif next_char == '\\':
+                    result.append('\\')
+                    i += 2
+                    continue
+                elif next_char == "'":
+                    result.append("'")
+                    i += 2
+                    continue
+            
+            result.append(s[i])
+            i += 1
+        
+        return ''.join(result)
+
+    @staticmethod
+    def dequote_value(cqlword, decode_escapes=True):
         cqlword = cqlword.strip()
         if cqlword == '':
             return cqlword
         if cqlword[0] == "'" and cqlword[-1] == "'":
             cqlword = cqlword[1:-1].replace("''", "'")
+            # Decode escape sequences after removing quotes
+            if decode_escapes:
+                cqlword = Cql3ParsingRuleSet.decode_escape_sequences(cqlword)
         return cqlword
 
 
@@ -155,6 +215,7 @@ explain_completion = CqlRuleSet.explain_completion
 dequote_value = CqlRuleSet.dequote_value
 dequote_name = CqlRuleSet.dequote_name
 escape_value = CqlRuleSet.escape_value
+decode_escape_sequences = CqlRuleSet.decode_escape_sequences
 
 # BEGIN SYNTAX/COMPLETION RULE DEFINITIONS
 
@@ -296,6 +357,12 @@ JUNK ::= /([ \t\r\f\v]+|(--|[/][/])[^\n\r]*([\n\r]|$)|[/][*].*?[*][/])/ ;
                             | <alterRoleStatement>
                             | <dropRoleStatement>
                             | <listRolesStatement>
+                            | <createSlaStatement>
+                            | <alterSlaStatement>
+                            | <dropSlaStatement>
+                            | <listSlaStatement>
+                            | <attachSlaStatement>
+                            | <detachRSlaStatement>
                             ;
 
 <authorizationStatement> ::= <grantStatement>
@@ -436,7 +503,7 @@ def ks_prop_val_completer(ctxt, cass):
     if optname == 'durable_writes':
         return ["'true'", "'false'"]
     if optname == 'replication':
-        return ["{'class': '"]
+        return ["{'class': 'NetworkTopologyStrategy'"]
     return ()
 
 
@@ -465,7 +532,10 @@ def ks_prop_val_mapval_completer(ctxt, cass):
         return ()
     currentkey = dequote_value(ctxt.get_binding('propmapkey')[-1])
     if currentkey == 'class':
-        return list(map(escape_value, CqlRuleSet.replication_strategies))
+        partial = ctxt.get_binding('partial', '')
+        if partial == '':
+            return [escape_value('NetworkTopologyStrategy')]
+        return [s for s in CqlRuleSet.replication_strategies if s.startswith(partial)]
     return [Hint('<term>')]
 
 
@@ -1499,6 +1569,41 @@ syntax_rules += r'''
 <listRolesStatement> ::= "LIST" "ROLES"
                               ( "OF" <rolename> )? "NORECURSIVE"?
                        ;
+'''
+
+syntax_rules += r'''
+<slaName> ::= <identifier>
+             | <quotedName>
+             | <unreservedKeyword>
+             ;
+
+<createSlaStatement> ::= "CREATE" "SERVICE_LEVEL" ( "IF" "NOT" "EXISTS" )? <slaName>
+                              ( "WITH" <slaProperty> ("AND" <slaProperty>)*)?
+                        ;
+
+<alterSlaStatement> ::= "ALTER" "SERVICE_LEVEL" ("IF" "EXISTS")? <slaName>
+                              ( "WITH" <slaProperty> ("AND" <slaProperty>)*)?
+                       ;
+
+<slaProperty> ::= "WORKLOAD_TYPE" "=" <stringLiteral>
+                 | "TIMEOUT" "=" <wholenumber>
+                 | "SHARES" "=" <wholenumber>
+                 ;
+
+<dropSlaStatement> ::= "DROP" "SERVICE_LEVEL" ("IF" "EXISTS")? <slaName>
+                      ;
+
+<listSlaStatement> ::= ("LIST" "SERVICE_LEVEL" <slaName> )
+                       | ("LIST" "ATTACHED" "SERVICE_LEVEL" "OF" <rolename> )
+                       | ("LIST" "ALL" "SERVICE_LEVELS" )
+                       | ("LIST" "ALL" "ATTACHED" "SERVICE_LEVELS" )
+                       ;
+
+<attachSlaStatement> ::= "ATTACH" "SERVICE_LEVEL" <slaName> "TO" <rolename>
+                       ;
+
+<detachRSlaStatement> ::= "DETACH" "SERVICE_LEVEL" <slaName> "FROM" <rolename>
+                        ;
 '''
 
 syntax_rules += r'''

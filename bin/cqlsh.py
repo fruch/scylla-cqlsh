@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -20,7 +20,6 @@ import cmd
 import codecs
 import configparser
 import csv
-import errno
 import getpass
 import optparse
 import os
@@ -32,13 +31,14 @@ import sys
 import traceback
 import warnings
 import webbrowser
+import logging
 from contextlib import contextmanager
 from glob import glob
 from io import StringIO
 from uuid import UUID
 
-if sys.version_info < (3, 6):
-    sys.exit("\ncqlsh requires Python 3.6+\n")
+if sys.version_info < (3, 10):
+    sys.exit("\ncqlsh requires Python 3.10+\n")
 
 # see CASSANDRA-10428
 if platform.python_implementation().startswith('Jython'):
@@ -47,11 +47,6 @@ if platform.python_implementation().startswith('Jython'):
 UTF8 = 'utf-8'
 
 description = "CQL Shell for Apache Cassandra"
-
-try:
-    from cqlshlib._version import __version__ as version
-except ImportError:
-    version = "6.2.0"
 
 readline = None
 try:
@@ -135,12 +130,18 @@ except ImportError as e:
 
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
+from cassandra.connection import UnixSocketEndPoint
 from cassandra.cqltypes import cql_typename
 from cassandra.marshal import int64_unpack
-from cassandra.metadata import (ColumnMetadata, KeyspaceMetadata, TableMetadata, protect_name, protect_names, protect_value)
-from cassandra.policies import WhiteListRoundRobinPolicy
+from cassandra.metadata import (ColumnMetadata, KeyspaceMetadata, TableMetadata, protect_name, protect_names)
+from cassandra.policies import RoundRobinPolicy, WhiteListRoundRobinPolicy
 from cassandra.query import SimpleStatement, ordered_dict_factory, TraceUnavailable
 from cassandra.util import datetime_from_timestamp
+try:
+    from cassandra.client_routes import ClientRouteProxy, ClientRoutesConfig
+except ImportError:
+    ClientRouteProxy = None
+    ClientRoutesConfig = None
 
 # cqlsh should run correctly when run out of a Cassandra source tree,
 # out of an unpacked Cassandra tarball, and after a proper package install.
@@ -151,13 +152,23 @@ if os.path.isdir(cqlshlibdir):
 from cqlshlib import cql3handling, pylexotron, sslhandling, cqlshhandling, authproviderhandling
 from cqlshlib.copyutil import ExportTask, ImportTask
 from cqlshlib.displaying import (ANSI_RESET, BLUE, COLUMN_NAME_COLORS, CYAN,
-                                 RED, WHITE, FormattedValue, colorme)
+                                 RED, YELLOW, WHITE, FormattedValue, colorme)
 from cqlshlib.formatting import (DEFAULT_DATE_FORMAT, DEFAULT_NANOTIME_FORMAT,
                                  DEFAULT_TIMESTAMP_FORMAT, CqlType, DateTimeFormat,
                                  format_by_type)
 from cqlshlib.tracing import print_trace, print_trace_session
-from cqlshlib.util import get_file_encoding_bomsize
+from cqlshlib.util import control_connection_query_fallback_kwargs, get_file_encoding_bomsize
 from cqlshlib.util import is_file_secure, trim_if_present
+
+try:
+    from cqlshlib._version import __version__ as version
+except ImportError:
+    # Get the version relative to the current file, suppressing UserWarnings from setuptools_scm
+    from setuptools_scm import get_version
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        version = get_version(root='..', relative_to=__file__, tag_regex=r'^(?P<prefix>v)?(?P<version>[^\+-]+)(?P<suffix>-scylla)?$')
 
 
 DEFAULT_HOST = '127.0.0.1'
@@ -194,12 +205,24 @@ parser.add_option("--browser", dest='browser', help="""The browser to use to dis
                                                     - one of the supported browsers in https://docs.python.org/3/library/webbrowser.html.
                                                     - browser path followed by %s, example: /usr/bin/google-chrome-stable %s""")
 parser.add_option('--ssl', action='store_true', help='Use SSL', default=False)
+parser.add_option('--no-compression', action='store_true', help='Disable compression', default=False)
+parser.add_option('--client-route', action='append', dest='client_routes',
+                  metavar='CONNECTION_ID[=ADDRESS]',
+                  help='Enable client routes. Repeat for each CONNECTION_ID[=ADDRESS].')
+parser.add_option('--client-routes-advanced-shard-awareness', action='store_true',
+                  dest='client_routes_advanced_shard_awareness',
+                  help='Use shard-aware ports with client routes.')
+parser.add_option('--no-client-routes-advanced-shard-awareness', action='store_false',
+                  dest='client_routes_advanced_shard_awareness',
+                  help='Do not use shard-aware ports with client routes.')
 parser.add_option("-u", "--username", help="Authenticate as user.")
 parser.add_option("-p", "--password", help="Authenticate using password.")
 parser.add_option('-k', '--keyspace', help='Authenticate to the given keyspace.')
 parser.add_option("-f", "--file", help="Execute commands from FILE, then exit")
 parser.add_option('--debug', action='store_true',
                   help='Show additional debugging information')
+parser.add_option('--driver-debug', action='store_true',
+                  help='Show additional driver debugging information')
 parser.add_option('--coverage', action='store_true',
                   help='Collect coverage data')
 parser.add_option("--encoding", help="Specify a non-default encoding for output."
@@ -211,7 +234,7 @@ parser.add_option('--cqlversion', default=None,
                        'by default the highest version supported by the server will be used.'
                        ' Examples: "3.0.3", "3.1.0"')
 parser.add_option("--protocol-version", type="int", default=None,
-                  help='Specify a specific protcol version otherwise the client will default and downgrade as necessary')
+                  help='Specify a specific protocol version otherwise the client will default and downgrade as necessary')
 
 parser.add_option("-e", "--execute", help='Execute the statement and quit.')
 parser.add_option("--connect-timeout", default=DEFAULT_CONNECT_TIMEOUT_SECONDS, dest='connect_timeout',
@@ -221,7 +244,6 @@ parser.add_option("--request-timeout", default=DEFAULT_REQUEST_TIMEOUT_SECONDS, 
 parser.add_option("-t", "--tty", action='store_true', dest='tty',
                   help='Force tty mode (command prompt).')
 parser.add_option('-v', action="version", help='Print the current version of cqlsh.')
-parser.add_option("--cloudconf", default=None, help='Configuration file for Scylla Cloud Serverless')
 
 # This is a hidden option to suppress the warning when the -p/--password command line option is used.
 # Power users may use this option if they know no other people has access to the system where cqlsh is run or don't care about security.
@@ -450,12 +472,19 @@ class Shell(cmd.Cmd):
                  connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS,
                  is_subshell=False,
                  auth_provider=None,
-                 cloudconf=None):
+                 no_compression=False,
+                 client_routes_config=None,
+                 contact_points=None,
+                 profiles=None,
+                 ):
         cmd.Cmd.__init__(self, completekey=completekey)
         self.hostname = hostname
         self.port = port
         self.auth_provider = auth_provider
         self.username = username
+        self.no_compression = no_compression
+        self.client_routes_config = client_routes_config
+        self.contact_points = tuple(contact_points) if contact_points else (self.hostname,)
 
         if isinstance(auth_provider, PlainTextAuthProvider):
             self.username = auth_provider.username
@@ -464,12 +493,18 @@ class Shell(cmd.Cmd):
                 password = getpass.getpass()
                 self.auth_provider = PlainTextAuthProvider(username=auth_provider.username, password=password)
 
-        self.cloudconf = cloudconf
         self.keyspace = keyspace
         self.ssl = ssl
         self.tracing_enabled = tracing_enabled
         self.page_size = self.default_page_size
         self.expand_enabled = expand_enabled
+        # LOGIN builds a new Cluster from these, so they have to be set even for a subshell
+        # that borrows its parent's connection and never builds one here
+        self.profiles = profiles if profiles is not None else {
+            EXEC_PROFILE_DEFAULT: ExecutionProfile(consistency_level=cassandra.ConsistencyLevel.ONE,
+                                                   request_timeout=request_timeout,
+                                                   row_factory=ordered_dict_factory)
+        }
         if use_conn:
             self.conn = use_conn
         else:
@@ -477,24 +512,35 @@ class Shell(cmd.Cmd):
             if protocol_version is not None:
                 kwargs['protocol_version'] = protocol_version
 
-            profiles = {
-                EXEC_PROFILE_DEFAULT: ExecutionProfile(consistency_level=cassandra.ConsistencyLevel.ONE,
-                                                       request_timeout=request_timeout,
-                                                       row_factory=ordered_dict_factory)
-            }
-
-            if cloudconf is None:
-                kwargs['contact_points'] = (self.hostname,)
-                kwargs['port'] = self.port
-                kwargs['ssl_options'] = sslhandling.ssl_settings(hostname, CONFIG_FILE) if ssl else None
-                profiles[EXEC_PROFILE_DEFAULT].load_balancing_policy = WhiteListRoundRobinPolicy([self.hostname])
+            if self.is_unix_socket(self.hostname):
+                self.contact_points = (UnixSocketEndPoint(self.hostname),)
+                kwargs['contact_points'] = self.contact_points
+                if client_routes_config is None:
+                    self.profiles[EXEC_PROFILE_DEFAULT].load_balancing_policy = WhiteListRoundRobinPolicy(self.contact_points)
+            else:
+                self.contact_points = tuple(contact_points) if contact_points else (self.hostname,)
+                kwargs['contact_points'] = self.contact_points
+                if client_routes_config is None:
+                    self.profiles[EXEC_PROFILE_DEFAULT].load_balancing_policy = WhiteListRoundRobinPolicy(self.contact_points)
+            if client_routes_config is not None:
+                kwargs['client_routes_config'] = client_routes_config
+                self.profiles[EXEC_PROFILE_DEFAULT].load_balancing_policy = RoundRobinPolicy()
+            kwargs['port'] = self.port
+            kwargs['ssl_context'] = sslhandling.ssl_settings(hostname, CONFIG_FILE) if ssl else None
+            # workaround until driver would know not to lose the DNS names for `server_hostname`
+            kwargs['ssl_options'] = {'server_hostname': self.hostname} if ssl else None
+            kwargs.update(control_connection_query_fallback_kwargs())
+            
+            # Disable compression if requested. When not set, the driver will use its default
+            # compression behavior (which is to enable compression if lz4 is available)
+            if no_compression:
+                kwargs['compression'] = False
 
             self.conn = Cluster(cql_version=cqlver,
                                 auth_provider=self.auth_provider,
                                 control_connection_timeout=connect_timeout,
                                 connect_timeout=connect_timeout,
-                                execution_profiles=profiles,
-                                scylla_cloud=cloudconf,
+                                execution_profiles=self.profiles,
                                 **kwargs)
         self.owns_connection = not use_conn
 
@@ -557,6 +603,21 @@ class Shell(cmd.Cmd):
         self.single_statement = single_statement
         self.is_subshell = is_subshell
 
+    def is_unix_socket(self, path):
+        """
+        Check if the given path is a Unix domain socket.
+
+        Args:
+            path (str): File path to check
+
+        Returns:
+            bool: True if path is a Unix socket, False otherwise
+        """
+        try:
+            return stat.S_ISSOCK(os.stat(path).st_mode)
+        except OSError:
+            return False
+
     @property
     def batch_mode(self):
         return not self.tty
@@ -603,9 +664,12 @@ class Shell(cmd.Cmd):
         self.show_version()
 
     def show_host(self):
-        if self.cloudconf is not None:
-            print("Connected to {0} at Scylla Cloud."
-                  .format(self.applycolor(self.get_cluster_name(), BLUE)))
+        # Check if the hostname is a Unix domain socket
+        if self.is_unix_socket(self.hostname):
+            # For Unix sockets, don't display the port
+            print("Connected to {0} at {1}"
+                  .format(self.applycolor(self.get_cluster_name(), BLUE),
+                          self.hostname))
         else:
             print("Connected to {0} at {1}:{2}"
                   .format(self.applycolor(self.get_cluster_name(), BLUE),
@@ -999,6 +1063,21 @@ class Shell(cmd.Cmd):
         cmdword = tokens[0][1]
         if cmdword == '?':
             cmdword = 'help'
+
+        cmdword_lower = cmdword.lower()
+
+        # Describe statements get special treatment: we first want to
+        # send the request to the server and only when it fails will
+        # we attempt to perform it locally. That's why we don't want
+        # to follow the logic below that starts with parsing.
+        #
+        # The reason for that is changes in Scylla may need to be reflected
+        # in the grammar used in cqlsh. We want Scylla to be "independent"
+        # in that regard, so unless necessary, we don't want to do the parsing
+        # here.
+        if cmdword_lower == 'describe' or cmdword_lower == 'desc':
+            return self.perform_describe(cmdword, tokens, srcstr)
+
         custom_handler = getattr(self, 'do_' + cmdword.lower(), None)
         if custom_handler:
             parsed = cqlruleset.cql_whole_parse_tokens(tokens, srcstr=srcstr,
@@ -1107,8 +1186,8 @@ class Shell(cmd.Cmd):
             try:
                 self.conn.refresh_schema_metadata(5)  # will throw exception if there is a schema mismatch
             except Exception:
-                self.printerr("Warning: schema version mismatch detected; check the schema versions of your "
-                              "nodes in system.local and system.peers.")
+                self.printwarn("Warning: schema version mismatch detected; check the schema versions of your "
+                               "nodes in system.local and system.peers.")
                 self.conn.refresh_schema_metadata(-1)
 
         if result is None:
@@ -1283,9 +1362,13 @@ class Shell(cmd.Cmd):
             return
         return cqlruleset.dequote_name(namestr)
 
-    def cql_unprotect_value(self, valstr):
+    def cql_unprotect_value(self, valstr, decode_escapes=True):
         if valstr is not None:
-            return cqlruleset.dequote_value(valstr)
+            return cqlruleset.dequote_value(valstr, decode_escapes)
+
+    def cql_unprotect_filename(self, valstr):
+        # file names are literal: decoding escapes would turn C:\temp\new.csv into a tab and a newline
+        return self.cql_unprotect_value(valstr, decode_escapes=False)
 
     def print_recreate_keyspace(self, ksdef, out):
         out.write(ksdef.export_as_string())
@@ -1488,8 +1571,8 @@ class Shell(cmd.Cmd):
                 self.print_recreate_keyspace(k, sys.stdout)
                 print('')
 
-    def do_describe(self, parsed):
-
+    # Precondition: the first token in `srcstr.lower()` is either `describe` or `desc`.
+    def perform_describe(self, cmdword, tokens, srcstr):
         """
         DESCRIBE [cqlsh only]
 
@@ -1580,7 +1663,8 @@ class Shell(cmd.Cmd):
           where object can be either a keyspace or a table or an index or a materialized
           view (in this order).
         """
-        if self.connection_versions['build'][0] < '4':
+
+        def perform_describe_locally(parsed):
             what = parsed.matched[1][1].lower()
             if what == 'functions':
                 self.describe_functions_client(self.current_keyspace)
@@ -1638,36 +1722,45 @@ class Shell(cmd.Cmd):
                 if not name:
                     name = self.cql_unprotect_name(parsed.get_binding('mvname', None))
                 self.describe_object_client(ks, name)
-        else:
-            stmt = SimpleStatement(parsed.extract_orig(), consistency_level=cassandra.ConsistencyLevel.LOCAL_ONE,
-                                   fetch_size=self.page_size if self.use_paging else None)
-            future = self.session.execute_async(stmt)
-            try:
-                result = future.result()
 
-                what = parsed.matched[1][1].lower()
+        stmt = SimpleStatement(srcstr, consistency_level=cassandra.ConsistencyLevel.LOCAL_ONE,
+                               fetch_size=self.page_size if self.use_paging else None)
+        future = self.session.execute_async(stmt)
+        try:
+            result = future.result()
 
-                if what in ('columnfamilies', 'tables', 'types', 'functions', 'aggregates'):
-                    self.describe_list(result)
-                elif what == 'keyspaces':
-                    self.describe_keyspaces(result)
-                elif what == 'cluster':
-                    self.describe_cluster(result)
-                elif what:
-                    self.describe_element(result)
+            # The second token in the statement indicates which
+            # kind of DESCRIBE we're performing.
+            what = srcstr.split()[1].lower().rstrip(';')
 
-            except CQL_ERRORS as err:
-                err_msg = err.message if hasattr(err, 'message') else str(err)
-                self.printerr(err_msg.partition("message=")[2].strip('"'))
-            except Exception:
-                import traceback
-                self.printerr(traceback.format_exc())
+            if what in ('columnfamilies', 'tables', 'types', 'functions', 'aggregates'):
+                self.describe_list(result)
+            elif what == 'keyspaces':
+                self.describe_keyspaces(result)
+            elif what == 'cluster':
+                self.describe_cluster(result)
+            elif what:
+                self.describe_element(result)
 
-            if future:
-                if future.warnings:
-                    self.print_warnings(future.warnings)
+        except cassandra.protocol.SyntaxException:
+            # Server doesn't support DESCRIBE query, retry with
+            # client-side DESCRIBE implementation
+            parsed = cqlruleset.cql_whole_parse_tokens(tokens, srcstr=srcstr,
+                                                       startsymbol='cqlshCommand')
+            if parsed and not parsed.remainder:
+                return perform_describe_locally(parsed)
+            else:
+                return self.handle_parse_error(cmdword, tokens, parsed, srcstr)
+        except CQL_ERRORS as err:
+            err_msg = err.message if hasattr(err, 'message') else str(err)
+            self.printerr(err_msg.partition("message=")[2].strip('"'))
+        except Exception:
+            import traceback
+            self.printerr(traceback.format_exc())
 
-    do_desc = do_describe
+        if future:
+            if future.warnings:
+                self.print_warnings(future.warnings)
 
     def describe_keyspaces(self, rows):
         """
@@ -1829,10 +1922,11 @@ class Shell(cmd.Cmd):
 
         fname = parsed.get_binding('fname', None)
         if fname is not None:
-            fname = self.cql_unprotect_value(fname)
+            fname = self.cql_unprotect_filename(fname)
 
         copyoptnames = list(map(str.lower, parsed.get_binding('optnames', ())))
-        copyoptvals = list(map(self.cql_unprotect_value, parsed.get_binding('optvals', ())))
+        copyoptvals = [self.cql_unprotect_filename(v) if n in ('errfile', 'ratefile') else self.cql_unprotect_value(v)
+                       for n, v in zip(copyoptnames, parsed.get_binding('optvals', ()))]
         opts = dict(list(zip(copyoptnames, copyoptvals)))
 
         direction = parsed.get_binding('dir').upper()
@@ -1909,10 +2003,10 @@ class Shell(cmd.Cmd):
         See also the --file option to cqlsh.
         """
         fname = parsed.get_binding('fname')
-        fname = os.path.expanduser(self.cql_unprotect_value(fname))
+        fname = os.path.expanduser(self.cql_unprotect_filename(fname))
         try:
             encoding, bom_size = get_file_encoding_bomsize(fname)
-            f = codecs.open(fname, 'r', encoding)
+            f = open(fname, 'r', encoding=encoding, newline='')
             f.seek(bom_size)
         except IOError as e:
             self.printerr('Could not open %r: %s' % (fname, e))
@@ -1933,7 +2027,11 @@ class Shell(cmd.Cmd):
                          connect_timeout=self.conn.connect_timeout,
                          is_subshell=True,
                          auth_provider=self.auth_provider,
-                         cloudconf=self.cloudconf)
+                         no_compression=self.no_compression,
+                         client_routes_config=self.client_routes_config,
+                         contact_points=self.contact_points,
+                         profiles=self.profiles,
+                         )
         # duplicate coverage related settings in subshell
         if self.coverage:
             subshell.coverage = True
@@ -1992,7 +2090,7 @@ class Shell(cmd.Cmd):
                           ' to disable.' % (self.query_out.name,))
             return
 
-        fname = os.path.expanduser(self.cql_unprotect_value(fname))
+        fname = os.path.expanduser(self.cql_unprotect_filename(fname))
         try:
             f = open(fname, 'a')
         except IOError as e:
@@ -2119,17 +2217,24 @@ class Shell(cmd.Cmd):
         auth_provider = PlainTextAuthProvider(username=username, password=password)
 
         kwargs = {}
-        if self.cloudconf is None:
-                kwargs['contact_points'] = (self.hostname,)
-                kwargs['port'] = self.port
-                kwargs['ssl_options'] = self.conn.ssl_options
-                kwargs['load_balancing_policy'] = WhiteListRoundRobinPolicy([self.hostname])
+        kwargs['contact_points'] = self.contact_points
+        kwargs['port'] = self.port
+        kwargs['ssl_context'] = self.conn.ssl_context
+        kwargs['ssl_options'] = self.conn.ssl_options
+        if self.client_routes_config is not None:
+            kwargs['client_routes_config'] = self.client_routes_config
+        kwargs.update(control_connection_query_fallback_kwargs())
+        
+        # Preserve compression setting from original connection
+        if self.no_compression:
+            kwargs['compression'] = False
+
         conn = Cluster(cql_version=self.conn.cql_version,
                        protocol_version=self.conn.protocol_version,
                        auth_provider=auth_provider,
                        control_connection_timeout=self.conn.connect_timeout,
                        connect_timeout=self.conn.connect_timeout,
-                       scylla_cloud=self.cloudconf,
+                       execution_profiles=self.profiles,
                        **kwargs)
 
         if self.current_keyspace:
@@ -2138,9 +2243,6 @@ class Shell(cmd.Cmd):
             session = conn.connect()
 
         # Copy session properties
-        session.default_timeout = self.session.default_timeout
-        session.row_factory = self.session.row_factory
-        session.default_consistency_level = self.session.default_consistency_level
         session.max_trace_wait = self.session.max_trace_wait
 
         # Update after we've connected in case we fail to authenticate
@@ -2285,6 +2387,13 @@ class Shell(cmd.Cmd):
             text = '%s:%d:%s' % (self.stdin.name, self.lineno, text)
         self.writeresult(text, color, newline=newline, out=sys.stderr)
 
+    def printwarn(self, text, color=YELLOW, newline=True, shownum=None):
+        if shownum is None:
+            shownum = self.show_line_nums
+        if shownum:
+            text = '%s:%d:%s' % (self.stdin.name, self.lineno, text)
+        self.writeresult(text, color, newline=newline, out=sys.stderr)
+
     def stop_coverage(self):
         if self.coverage and self.cov is not None:
             self.cov.stop()
@@ -2370,6 +2479,59 @@ def raw_option_with_default(configs, section, option, default=None):
         return default
 
 
+def parse_client_route_spec(spec):
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("client route must not be empty")
+
+    connection_id, separator, address_override = spec.partition('=')
+    connection_id = connection_id.strip()
+    if not connection_id:
+        raise ValueError("client route %r has empty connection id" % (spec,))
+
+    if not separator:
+        return connection_id, None
+
+    address_override = address_override.strip()
+    if not address_override:
+        raise ValueError("client route %r has empty address override" % (spec,))
+
+    return connection_id, address_override
+
+
+def parse_client_routes(value):
+    if not value:
+        return []
+
+    if isinstance(value, (list, tuple)):
+        raw_specs = []
+        for item in value:
+            raw_specs.extend(re.split(r'[\n,]+', item))
+    else:
+        raw_specs = re.split(r'[\n,]+', value)
+
+    routes = []
+    for spec in raw_specs:
+        if not spec or not spec.strip():
+            continue
+        routes.append(parse_client_route_spec(spec))
+    return routes
+
+
+def build_client_routes_config(routes, advanced_shard_awareness):
+    if not routes:
+        return None
+
+    if ClientRouteProxy is None or ClientRoutesConfig is None:
+        parser.error("Installed Scylla Python driver does not support client routes.")
+
+    proxies = [ClientRouteProxy(connection_id, address_override)
+               for connection_id, address_override in routes]
+    return ClientRoutesConfig(
+        proxies=proxies,
+        advanced_shard_awareness=advanced_shard_awareness)
+
+
 def should_use_color():
     if not sys.stdout.isatty():
         return False
@@ -2401,7 +2563,8 @@ def read_options(cmdlineargs, environment):
             print("\nWarning: Password is found in an insecure cqlshrc file. The file is owned or readable by other users on the system.",
                   end='', file=sys.stderr)
         print("\nNotice: Credentials in the cqlshrc file is deprecated and will be ignored in the future."
-              "\nPlease use a credentials file to specify the username and password.\n", file=sys.stderr)
+              "\nPlease use a credentials file to specify the username and password.\n"
+              "\nTo use basic authentication, place the username and password in the [PlainTextAuthProvider] section of the credentials file.\n", file=sys.stderr)
 
     optvalues = optparse.Values()
 
@@ -2428,27 +2591,47 @@ def read_options(cmdlineargs, environment):
     optvalues.max_trace_wait = option_with_default(configs.getfloat, 'tracing', 'max_trace_wait',
                                                    DEFAULT_MAX_TRACE_WAIT)
     optvalues.timezone = option_with_default(configs.get, 'ui', 'timezone', None)
+    try:
+        config_client_routes = parse_client_routes(
+            raw_option_with_default(rawconfigs, 'client_routes', 'proxies', ''))
+    except ValueError as e:
+        parser.error(str(e))
 
     optvalues.debug = False
-
+    optvalues.driver_debug = False
     optvalues.coverage = False
     if 'CQLSH_COVERAGE' in environment.keys():
         optvalues.coverage = True
 
     optvalues.file = None
     optvalues.ssl = option_with_default(configs.getboolean, 'connection', 'ssl', DEFAULT_SSL)
+    optvalues.no_compression = option_with_default(configs.getboolean, 'connection', 'no_compression', False)
+    optvalues.client_routes = None
+    optvalues.client_routes_advanced_shard_awareness = option_with_default(
+        configs.getboolean, 'client_routes', 'advanced_shard_awareness', False)
     optvalues.encoding = option_with_default(configs.get, 'ui', 'encoding', UTF8)
 
     optvalues.tty = option_with_default(configs.getboolean, 'ui', 'tty', sys.stdin.isatty())
-    optvalues.protocol_version = option_with_default(configs.getint, 'protocol', 'version', None)
+    optvalues.protocol_version = option_with_default(configs.getint, 'protocol', 'version', 4)
     optvalues.cqlversion = option_with_default(configs.get, 'cql', 'version', None)
     optvalues.connect_timeout = option_with_default(configs.getint, 'connection', 'timeout', DEFAULT_CONNECT_TIMEOUT_SECONDS)
     optvalues.request_timeout = option_with_default(configs.getint, 'connection', 'request_timeout', DEFAULT_REQUEST_TIMEOUT_SECONDS)
     optvalues.execute = None
     optvalues.insecure_password_without_warning = False
-    optvalues.cloudconf = option_with_default(configs.getboolean, 'connection', 'cloudconf', None)
 
     (options, arguments) = parser.parse_args(cmdlineargs, values=optvalues)
+
+    try:
+        if options.client_routes is None:
+            options.client_routes = config_client_routes
+        else:
+            options.client_routes = parse_client_routes(options.client_routes)
+    except ValueError as e:
+        parser.error(str(e))
+
+    options.client_routes_config = build_client_routes_config(
+        options.client_routes,
+        options.client_routes_advanced_shard_awareness)
 
     # Credentials from cqlshrc will be expanded,
     # credentials from the command line are also expanded if there is a space...
@@ -2473,7 +2656,7 @@ def read_options(cmdlineargs, environment):
         credentials.read(options.credentials)
 
         # use the username from credentials file but fallback to cqlshrc if username is absent from the command line parameters
-        options.username = username_from_cqlshrc
+        options.username = option_with_default(credentials.get, 'plain_text_auth', 'username', username_from_cqlshrc)
 
     if not options.password:
         rawcredentials = configparser.RawConfigParser()
@@ -2481,7 +2664,6 @@ def read_options(cmdlineargs, environment):
 
         # handling password in the same way as username, priority cli > credentials > cqlshrc
         options.password = option_with_default(rawcredentials.get, 'plain_text_auth', 'password', password_from_cqlshrc)
-        options.password = password_from_cqlshrc
     elif not options.insecure_password_without_warning:
         print("\nWarning: Using a password on the command line interface can be insecure."
               "\nRecommendation: use the credentials file to securely provide the password.\n", file=sys.stderr)
@@ -2492,15 +2674,10 @@ def read_options(cmdlineargs, environment):
     options.password = maybe_ensure_text(options.password)
     options.keyspace = maybe_ensure_text(options.keyspace)
 
-    if options.cloudconf is not None:
-        if len(arguments) > 0:
-            parser.error("Cannot use --cloudconf with hostname or port")
-        if options.ssl:
-            parser.error("Cannot use --cloudconf with --ssl. Cloud connection encryption parameters are provided by cloud config bundle.")
-            
-
-    hostname = option_with_default(configs.get, 'connection', 'hostname', DEFAULT_HOST)
+    config_hostname = option_with_default(configs.get, 'connection', 'hostname')
+    hostname = config_hostname or DEFAULT_HOST
     port = option_with_default(configs.get, 'connection', 'port', DEFAULT_PORT)
+    host_was_explicit = config_hostname is not None
 
     try:
         options.connect_timeout = int(options.connect_timeout)
@@ -2514,13 +2691,23 @@ def read_options(cmdlineargs, environment):
         parser.error('"%s" is not a valid request timeout.' % (options.request_timeout,))
         options.request_timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
-    hostname = environment.get('CQLSH_HOST', hostname)
+    if 'CQLSH_HOST' in environment:
+        hostname = environment['CQLSH_HOST']
+        host_was_explicit = True
     port = environment.get('CQLSH_PORT', port)
 
     if len(arguments) > 0:
         hostname = arguments[0]
+        host_was_explicit = True
     if len(arguments) > 1:
         port = arguments[1]
+
+    options.contact_points = None
+    if options.client_routes_config is not None and not host_was_explicit:
+        client_route_contact_points = [address for _, address in options.client_routes if address]
+        if client_route_contact_points:
+            hostname = client_route_contact_points[0]
+            options.contact_points = tuple(client_route_contact_points)
 
     if options.file or options.execute:
         options.tty = False
@@ -2584,6 +2771,11 @@ def save_history():
 
 
 def main(options, hostname, port):
+    if options.driver_debug:
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                            stream=sys.stdout)
+        logging.getLogger("cassandra").setLevel(logging.DEBUG)
+
     setup_cqlruleset(options.cqlmodule)
     setup_cqldocs(options.cqlmodule)
     init_history()
@@ -2594,7 +2786,7 @@ def main(options, hostname, port):
     else:
         try:
             encoding, bom_size = get_file_encoding_bomsize(options.file)
-            stdin = codecs.open(options.file, 'r', encoding)
+            stdin = open(options.file, 'r', encoding=encoding, newline='')
             stdin.seek(bom_size)
         except IOError as e:
             sys.exit("Can't open %r: %s" % (options.file, e))
@@ -2604,7 +2796,8 @@ def main(options, hostname, port):
         sys.stderr.write("Using connect timeout: %s seconds\n" % (options.connect_timeout,))
         sys.stderr.write("Using '%s' encoding\n" % (options.encoding,))
         sys.stderr.write("Using ssl: %s\n" % (options.ssl,))
-        sys.stderr.write("Using cloudconf: %s\n" % (options.cloudconf,))
+        sys.stderr.write("Using compression: %s\n" % (not options.no_compression,))
+        sys.stderr.write("Using client routes: %s\n" % (options.client_routes_config is not None,))
 
     # create timezone based on settings, environment or auto-detection
     timezone = None
@@ -2667,7 +2860,10 @@ def main(options, hostname, port):
                           cred_file=options.credentials,
                           username=options.username,
                           password=options.password),
-                      cloudconf=options.cloudconf)
+                      no_compression=options.no_compression,
+                      client_routes_config=options.client_routes_config,
+                      contact_points=options.contact_points,
+                      )
     except KeyboardInterrupt:
         sys.exit('Connection aborted.')
     except CQL_ERRORS as e:

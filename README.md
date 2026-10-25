@@ -18,8 +18,8 @@ cqlsh ${SCYLLA_HOST} -e 'SELECT * FROM system.local'
 # or just using it interactively
 cqlsh ${SCYLLA_HOST} 
 
-# or using it with scylla-cloud
-cqlsh --cloudconf [path to connection bundle downloaded]
+# running with docker image interactively
+docker run -it scylladb/scylla-cqlsh ${SCYLLA_HOST}
 ```
 
 
@@ -57,6 +57,16 @@ ccm start
 pytest
 ```
 
+## Build from source
+
+```bash
+pip install build
+# optionally can disable the usage of cython
+# export CQLSH_NO_CYTHON=true
+python -m build -w
+...
+Successfully built scylla_cqlsh-6.0.24.dev0+gb09bc79361.d20240910-py3-none-any.whl
+```
 
 ## Creation of the repo
 

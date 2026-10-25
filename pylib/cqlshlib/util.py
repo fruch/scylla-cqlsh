@@ -114,6 +114,17 @@ def trim_if_present(s, prefix):
     return s
 
 
+def control_connection_query_fallback_kwargs():
+    try:
+        from cassandra.cluster import ControlConnectionQueryFallback
+    except ImportError:
+        return {}
+
+    return {
+        'allow_control_connection_query_fallback': ControlConnectionQueryFallback.Fallback
+    }
+
+
 def is_file_secure(filename):
     try:
         st = os.stat(filename)
@@ -121,6 +132,9 @@ def is_file_secure(filename):
         if e.errno != errno.ENOENT:
             raise
         # the file doesn't exist, the security of it is irrelevant
+        return True
+    if not hasattr(os, 'getuid'):
+        # Windows has no POSIX owner and mode bits to check
         return True
     uid = os.getuid()
 

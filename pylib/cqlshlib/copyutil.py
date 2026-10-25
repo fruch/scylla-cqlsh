@@ -32,6 +32,14 @@ import threading
 import time
 import traceback
 
+# Python 3.14 changed the default to 'forkserver', which is not compatible
+# with our relocatable python. It execs our Python binary, but without our
+# ld.so. Change it back to 'fork' to avoid issues.
+# Windows has no 'fork' start method, so only set it where available.
+if 'fork' in mp.get_all_start_methods():
+    mp.set_start_method('fork')
+
+
 from bisect import bisect_right
 from calendar import timegm
 from collections import defaultdict, namedtuple
@@ -51,7 +59,7 @@ from cassandra.metadata import protect_name, protect_names, protect_value
 from cassandra.policies import RetryPolicy, WhiteListRoundRobinPolicy, DCAwareRoundRobinPolicy, FallthroughRetryPolicy
 from cassandra.query import BatchStatement, BatchType, SimpleStatement, tuple_factory
 from cassandra.util import Date, Time
-from cqlshlib.util import profile_on, profile_off
+from cqlshlib.util import control_connection_query_fallback_kwargs, profile_on, profile_off
 
 from cqlshlib.cql3handling import CqlRuleSet
 from cqlshlib.displaying import NO_COLOR_MAP
@@ -84,6 +92,10 @@ def printmsg(msg, eol='\n'):
     sys.stdout.write(msg)
     sys.stdout.write(eol)
     sys.stdout.flush()
+
+
+def noop(*arg, **kwargs):
+    pass
 
 
 class OneWayPipe(object):
@@ -138,8 +150,7 @@ class SendingChannel(object):
                 except Exception as e:
                     printmsg('%s: %s' % (e.__class__.__name__, e.message if hasattr(e, 'message') else str(e)))
 
-        feeding_thread = threading.Thread(target=feed)
-        feeding_thread.setDaemon(True)
+        feeding_thread = threading.Thread(target=feed, daemon=True)
         feeding_thread.start()
 
     def send(self, obj):
@@ -160,6 +171,11 @@ class SendingChannels(object):
         self.pipes = [OneWayPipe() for _ in range(num_channels)]
         self.channels = [SendingChannel(p) for p in self.pipes]
         self.num_channels = num_channels
+        self._readers = [p.reader for p in self.pipes]
+
+    def release_readers(self):
+        for reader in self._readers:
+            reader.close()
 
     def close(self):
         for ch in self.channels:
@@ -177,11 +193,16 @@ class ReceivingChannels(object):
         self.pipes = [OneWayPipe() for _ in range(num_channels)]
         self.channels = [ReceivingChannel(p) for p in self.pipes]
         self._readers = [p.reader for p in self.pipes]
+        self._writers = [p.writer for p in self.pipes]
         self._rlocks = [p.rlock for p in self.pipes]
         self._rlocks_by_readers = dict([(p.reader, p.rlock) for p in self.pipes])
         self.num_channels = num_channels
 
         self.recv = self.recv_select if IS_LINUX else self.recv_polling
+
+    def release_writers(self):
+        for writer in self._writers:
+            writer.close()
 
     def recv_select(self, timeout):
         """
@@ -238,7 +259,7 @@ class CopyTask(object):
         self.ks = ks
         self.table = table
         self.table_meta = self.shell.get_table_meta(self.ks, self.table)
-        self.host = shell.conn.get_control_connection_host()
+        self.host = self.get_host(shell)
         self.fname = safe_normpath(fname)
         self.protocol_version = protocol_version
         self.config_file = config_file
@@ -249,7 +270,7 @@ class CopyTask(object):
             DEBUG = True
 
         # do not display messages when exporting to STDOUT unless --debug is set
-        self.printmsg = printmsg if self.fname is not None or direction == 'from' or DEBUG else None
+        self.printmsg = printmsg if self.fname is not None or direction == 'from' or DEBUG else noop
         self.options = self.parse_options(opts, direction)
 
         self.num_processes = self.options.copy['numprocesses']
@@ -444,6 +465,43 @@ class CopyTask(object):
         """
         return shell.get_column_names(ks, table) if not columns else columns
 
+    @staticmethod
+    def get_host(shell):
+        """
+        Return the host COPY uses to determine local datacenter and fallback address.
+
+        With client routes the control connection is opened against a proxy endpoint that
+        never matches a host in the driver metadata, so get_control_connection_host() keeps
+        returning None for the whole session and we have to pick a host ourselves. That pick
+        decides local_dc, which decides which replicas COPY talks to, so prefer a host we
+        know we are connected to, keep the choice deterministic instead of depending on
+        metadata iteration order, and say so when the cluster spans several datacenters.
+        """
+        host = shell.conn.get_control_connection_host()
+        if host is not None or getattr(shell, 'client_routes_config', None) is None:
+            return host
+
+        hosts = sorted(shell.conn.metadata.all_hosts(),
+                       key=lambda h: (str(h.datacenter), str(h.address)))
+        if not hosts:
+            shell.printerr('Unable to pick a host for COPY: the cluster metadata has no hosts')
+            return None
+
+        candidates = [h for h in hosts if h.is_up is not False] or hosts
+        # a contact point that is also a known host is the closest we can get to the host
+        # the control connection is actually talking to
+        contact_points = {str(getattr(cp, 'address', cp))
+                          for cp in (getattr(shell, 'contact_points', None) or ())}
+        chosen = next((h for h in candidates if str(h.address) in contact_points), candidates[0])
+
+        datacenters = sorted({str(h.datacenter) for h in candidates})
+        if len(datacenters) > 1:
+            shell.printerr('Warning: the control connection host is unknown with client routes, '
+                           'so COPY picked %s in datacenter %s out of %s. Data owned only by '
+                           'replicas in the other datacenters may be unreachable.'
+                           % (chosen.address, chosen.datacenter, ', '.join(datacenters)))
+        return chosen
+
     def close(self):
         self.stop_processes()
         self.inmsg.close()
@@ -465,7 +523,8 @@ class CopyTask(object):
         for i, process in enumerate(self.processes):
             process.start()
             self.trace_process(process.pid)
-
+        self.inmsg.release_writers()
+        self.outmsg.release_readers()
         self.trace_process(self.get_pid())
 
     def stop_processes(self):
@@ -479,6 +538,7 @@ class CopyTask(object):
         this dictionary must be picklable.
         """
         shell = self.shell
+        client_routes_config = getattr(shell, 'client_routes_config', None)
 
         return dict(ks=self.ks,
                     table=self.table,
@@ -490,6 +550,8 @@ class CopyTask(object):
                     port=shell.port,
                     ssl=shell.ssl,
                     auth_provider=shell.auth_provider,
+                    client_routes_config=client_routes_config,
+                    contact_points=getattr(shell, 'contact_points', None) if client_routes_config is not None else None,
                     cql_version=shell.conn.cql_version,
                     config_file=self.config_file,
                     protocol_version=self.protocol_version,
@@ -578,7 +640,7 @@ class ExportWriter(object):
             return CsvDest(output=sys.stdout, close=False)
         else:
             try:
-                ret = CsvDest(output=open(source_name, 'w'), close=True)
+                ret = CsvDest(output=open(source_name, 'w', newline='', encoding=self.options.copy['encoding']), close=True)
                 self.num_files += 1
                 return ret
             except IOError as e:
@@ -869,6 +931,7 @@ class FilesReader(object):
     """
     def __init__(self, fname, options):
         self.chunk_size = options.copy['chunksize']
+        self.encoding = options.copy['encoding']
         self.header = options.copy['header']
         self.max_rows = options.copy['maxrows']
         self.skip_rows = options.copy['skiprows']
@@ -878,8 +941,7 @@ class FilesReader(object):
         self.current_source = None
         self.num_read = 0
 
-    @staticmethod
-    def get_source(paths):
+    def get_source(self, paths):
         """
          Return a source generator. Each source is a named tuple
          wrapping the source input, file name and a boolean indicating
@@ -887,7 +949,7 @@ class FilesReader(object):
         """
         def make_source(fname):
             try:
-                return open(fname, 'r')
+                return open(fname, 'r', encoding=self.encoding)
             except IOError as e:
                 raise IOError("Can't open %r for reading: %s" % (fname, e))
 
@@ -1053,16 +1115,19 @@ class ImportErrorHandler(object):
         self.max_attempts = self.options.copy['maxattempts']
         self.max_parse_errors = self.options.copy['maxparseerrors']
         self.max_insert_errors = self.options.copy['maxinserterrors']
-        self.err_file = self.options.copy['errfile']
+        base_err_file = self.options.copy['errfile']
+        pid = os.getpid()
+        self.err_filename = f"{base_err_file}.pid{pid}"
         self.parse_errors = 0
         self.insert_errors = 0
         self.num_rows_failed = 0
 
-        if os.path.isfile(self.err_file):
-            now = datetime.datetime.now()
-            old_err_file = self.err_file + now.strftime('.%Y%m%d_%H%M%S')
-            printdebugmsg("Renaming existing %s to %s\n" % (self.err_file, old_err_file))
-            os.rename(self.err_file, old_err_file)
+        # Ensure directory exists for error file
+        err_dir = os.path.dirname(self.err_filename) or '.'
+        try:
+            os.makedirs(err_dir, exist_ok=True)
+        except OSError as e:
+            printdebugmsg(f"Warning: Could not create error directory {err_dir}: {e}")
 
     def max_exceeded(self):
         if self.insert_errors > self.max_insert_errors >= 0:
@@ -1077,11 +1142,16 @@ class ImportErrorHandler(object):
 
     def add_failed_rows(self, rows):
         self.num_rows_failed += len(rows)
-
-        with open(self.err_file, "a") as f:
-            writer = csv.writer(f, **self.options.dialect)
-            for row in rows:
-                writer.writerow(row)
+        try:
+            with open(self.err_filename, "a", buffering=1, newline='', encoding=self.options.copy['encoding']) as f:
+                writer = csv.writer(f, **self.options.dialect)
+                for row in rows:
+                    writer.writerow(row)
+        except Exception as exc:
+            printdebugmsg("Warning: failed to write failed rows to error file %s: %s" % (self.err_filename, exc))
+            if self.shell.debug:
+                traceback.print_exc()
+            raise
 
     def handle_error(self, err):
         """
@@ -1232,7 +1302,7 @@ class ImportTask(CopyTask):
         if self.error_handler.num_rows_failed:
             self.shell.printerr("Failed to process %d rows; failed rows written to %s" %
                                 (self.error_handler.num_rows_failed,
-                                 self.error_handler.err_file))
+                                 self.error_handler.err_filename))
 
         if not self.all_processes_running():
             self.shell.printerr("{} child process(es) died unexpectedly, aborting"
@@ -1409,6 +1479,8 @@ class ChildProcess(mp.Process):
         self.connect_timeout = params['connect_timeout']
         self.cql_version = params['cql_version']
         self.auth_provider = params['auth_provider']
+        self.client_routes_config = params['client_routes_config']
+        self.contact_points = params['contact_points']
         self.ssl = params['ssl']
         self.protocol_version = params['protocol_version']
         self.config_file = params['config_file']
@@ -1444,6 +1516,13 @@ class ChildProcess(mp.Process):
         printdebugmsg("Closing queues...")
         self.inmsg.close()
         self.outmsg.close()
+
+    def get_ssl_settings_host(self, default_host):
+        if self.client_routes_config is None or not self.contact_points:
+            return default_host
+
+        contact_point = self.contact_points[0]
+        return str(getattr(contact_point, 'address', contact_point))
 
     def start_coverage(self):
         import coverage
@@ -1676,18 +1755,26 @@ class ExportProcess(ChildProcess):
             session.add_request()
             return session
 
+        kwargs = {}
+        if self.client_routes_config is not None:
+            kwargs['contact_points'] = self.contact_points
+            kwargs['client_routes_config'] = self.client_routes_config
+        else:
+            kwargs['contact_points'] = (host,)
+
         new_cluster = Cluster(
-            contact_points=(host,),
             port=self.port,
             cql_version=self.cql_version,
             protocol_version=self.protocol_version,
             auth_provider=self.auth_provider,
-            ssl_options=ssl_settings(host, self.config_file) if self.ssl else None,
+            ssl_context=ssl_settings(self.get_ssl_settings_host(host), self.config_file) if self.ssl else None,
             load_balancing_policy=WhiteListRoundRobinPolicy([host]),
             default_retry_policy=ExpBackoffRetryPolicy(self),
             compression=None,
             control_connection_timeout=self.connect_timeout,
             connect_timeout=self.connect_timeout,
+            **control_connection_query_fallback_kwargs(),
+            **kwargs,
             idle_heartbeat_interval=0)
         session = ExportSession(new_cluster, self)
         self.hosts_to_sessions[host] = session
@@ -2060,6 +2147,17 @@ class ImportConversion(object):
         def convert_set(val, ct=cql_type):
             return frozenset(convert_mandatory(ct.subtypes[0], v) for v in split(val))
 
+        def convert_vector(val, ct=cql_type):
+            """
+            COPY TO writes vectors as lists. The driver's vector type keeps its element type
+            in ct.subtype rather than ct.subtypes, and only checks the dimension when the whole
+            batch is bound, so check it here to reject only this row.
+            """
+            vals = split(val)
+            if len(vals) != ct.vector_size:
+                raise ParseError('Invalid vector with %d elements, expected %d elements' % (len(vals), ct.vector_size))
+            return tuple(convert_mandatory(ct.subtype, v) for v in vals)
+
         def convert_map(val, ct=cql_type):
             """
             See ImmutableDict above for a discussion of why a special object is needed here.
@@ -2125,6 +2223,9 @@ class ImportConversion(object):
             'map': convert_map,
             'tuple': convert_tuple,
             'frozen': convert_single_subtype,
+            # the driver names the vector type after its Cassandra class, not 'vector' like the other types,
+            # so register both names in case it switches
+            **dict.fromkeys(CqlType.vector_type_names, convert_vector),
         }
 
         return converters.get(cql_type.typename, convert_unknown)
@@ -2232,7 +2333,7 @@ class TokenMap(object):
 
         self._initialize_ring()
 
-        # Note that refresh metadata is disabled by default and we currenlty do not intercept it
+        # Note that refresh metadata is disabled by default and we currently do not intercept it
         # If hosts are added, removed or moved during a COPY operation our token map is no longer optimal
         # However we can cope with hosts going down and up since we filter for replicas that are up when
         # making each batch
@@ -2348,18 +2449,27 @@ class ImportProcess(ChildProcess):
     @property
     def session(self):
         if not self._session:
+            kwargs = {}
+            if self.client_routes_config is not None:
+                kwargs['contact_points'] = self.contact_points
+                kwargs['client_routes_config'] = self.client_routes_config
+            else:
+                kwargs['contact_points'] = (self.hostname,)
+
             cluster = Cluster(
-                contact_points=(self.hostname,),
                 port=self.port,
                 cql_version=self.cql_version,
                 protocol_version=self.protocol_version,
                 auth_provider=self.auth_provider,
                 load_balancing_policy=FastTokenAwarePolicy(self),
-                ssl_options=ssl_settings(self.hostname, self.config_file) if self.ssl else None,
+                ssl_context=ssl_settings(self.get_ssl_settings_host(self.hostname),
+                                         self.config_file) if self.ssl else None,
                 default_retry_policy=FallthroughRetryPolicy(),  # we throw on timeouts and retry in the error callback
                 compression=None,
                 control_connection_timeout=self.connect_timeout,
                 connect_timeout=self.connect_timeout,
+                **control_connection_query_fallback_kwargs(),
+                **kwargs,
                 idle_heartbeat_interval=0,
                 connection_class=ConnectionWrapper)
 

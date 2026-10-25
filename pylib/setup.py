@@ -15,27 +15,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import sys
+import os
 import warnings
-from distutils.core import setup, Extension
+from setuptools import setup, Extension
 
 
 def get_extensions():
-    if "--no-compile" not in sys.argv:
-        try:
-            from Cython.Build import cythonize
-            return cythonize(Extension(name='copyutil', sources=["cqlshlib/copyutil.py"], define_macros=[("CYTHON_LIMITED_API", "1")]))
-        except ImportError:
-            warnings.warn("installing cython could speed things up for you; `pip install cython`")
-    return []
+    if os.environ.get('CQLSH_NO_CYTHON'):
+        return []
+    try:
+        from Cython.Build import cythonize
+        extensions = [Extension(name='copyutil',
+                                sources=["cqlshlib/copyutil.py"],
+                                define_macros=[("CYTHON_LIMITED_API", "1")])]
+        return cythonize(extensions,
+                         compiler_directives={'language_level': '3str'})
+    except ImportError:
+        warnings.warn("installing cython could speed things up for you; `pip install cython`")
 
 
 setup(
     name="scylla-cqlsh",
     install_requires=[
         "scylla-driver >= 3.25.10",
-        "six",
+        "lz4",
     ],
     ext_modules=get_extensions(),
     license="Apache",
@@ -44,7 +47,6 @@ setup(
         "Environment :: Console",
         "Topic :: Database :: Front-Ends",
         "License :: OSI Approved :: Apache Software License",
-        "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3",
-    ]
+    ],
 )

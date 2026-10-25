@@ -21,8 +21,9 @@
 import locale
 import os
 import re
+
 from .basecase import BaseTestCase
-from .cassconnect import create_db, remove_db, testrun_cqlsh
+from .cassconnect import create_db, remove_db, testrun_cqlsh, get_cassandra_connection
 from .run_cqlsh import TimeoutError
 from cqlshlib.cql3handling import CqlRuleSet
 
@@ -48,6 +49,15 @@ class CqlshCompletionCase(BaseTestCase):
             output = c.cmd_and_response("SELECT * FROM system_schema.scylla_tables LIMIT 1;")
             cls.is_scylla = '1 rows' in output
 
+        with get_cassandra_connection().connect() as session:
+            # Which of the non-mandatory system keyspaces exist depends on the
+            # server version and flavour (e.g. system_distributed_everywhere is
+            # gone from recent Scylla releases, system_replicated_keys only
+            # exists on enterprise builds), so ask the server rather than
+            # deducing it from the version number.
+            result = session.execute('SELECT keyspace_name FROM system_schema.keyspaces')
+            cls.server_keyspaces = {row.keyspace_name for row in result}
+
     @classmethod
     def tearDownClass(cls):
         remove_db()
@@ -62,6 +72,22 @@ class CqlshCompletionCase(BaseTestCase):
 
     def tearDown(self):
         self.cqlsh_runner.__exit__(None, None, None)
+
+    def _optional_scylla_keyspaces(self, *names):
+        """Of the given Scylla-only keyspaces, the ones this server actually has."""
+        if not self.is_scylla:
+            return []
+        return [name for name in names if name in self.server_keyspaces]
+
+    def _extra_keyspaces(self):
+        return self._optional_scylla_keyspaces('audit')
+
+    def _system_keyspaces(self):
+        if self.is_scylla:
+            return [name + '.' for name in self._optional_scylla_keyspaces(
+                'system_distributed_everywhere', 'audit', 'system_replicated_keys')]
+
+        return ['system_views.', 'system_virtual_schema.']
 
     def _get_completions(self, inputstring, split_completed_lines=True):
         """
@@ -167,7 +193,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                          'COPY', 'CREATE', 'DEBUG', 'DELETE', 'DESC', 'DESCRIBE',
                                          'DROP', 'GRANT', 'HELP', 'INSERT', 'LIST', 'LOGIN', 'PAGING', 'REVOKE',
                                          'SELECT', 'SHOW', 'SOURCE', 'TRACING', 'EXPAND', 'SERIAL', 'TRUNCATE',
-                                         'UPDATE', 'USE', 'exit', 'quit', 'CLEAR', 'CLS'))
+                                         'UPDATE', 'USE', 'exit', 'quit', 'CLEAR', 'CLS', 'ATTACH', 'DETACH'))
 
     def test_complete_command_words(self):
         self.trycompletions('alt', '\b\b\bALTER ')
@@ -254,7 +280,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
                      'EXPAND', 'GRANT', 'HELP', 'INSERT', 'LIST', 'LOGIN', 'PAGING',
                      'REVOKE', 'SELECT', 'SHOW', 'SOURCE', 'SERIAL', 'TRACING',
                      'TRUNCATE', 'UPDATE', 'USE', 'exit', 'quit',
-                     'CLEAR', 'CLS'])
+                     'CLEAR', 'CLS', 'ATTACH', 'DETACH'])
 
         self.trycompletions(
             ("INSERT INTO twenty_rows_composite_table (a, b, c) "
@@ -498,20 +524,21 @@ class TestCqlshCompletion(CqlshCompletionCase):
     def test_complete_in_create_keyspace(self):
         self.trycompletions('create keyspace ', '', choices=('<identifier>', '<quotedName>', 'IF'))
         self.trycompletions('create keyspace moo ',
-                            "WITH replication = {'class': '")
+                            "WITH replication = {'class': 'NetworkTopologyStrategy', ")
         self.trycompletions('create keyspace "12SomeName" with ',
-                            "replication = {'class': '")
-        self.trycompletions("create keyspace fjdkljf with foo=bar ", "",
+                            "replication = {'class': 'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace fjdkljf with replication = {'class': 'NetworkTopologyStrategy', 'dc1': 3} AND foo=bar ", "",
                             choices=('AND', ';'))
         self.trycompletions("create keyspace fjdkljf with foo=bar AND ",
-                            "replication = {'class': '")
-        self.trycompletions("create keyspace moo with replication", " = {'class': '")
-        self.trycompletions("create keyspace moo with replication=", " {'class': '")
-        self.trycompletions("create keyspace moo with replication={", "'class':'")
-        self.trycompletions("create keyspace moo with replication={'class'", ":'")
-        self.trycompletions("create keyspace moo with replication={'class': ", "'")
-        self.trycompletions("create keyspace moo with replication={'class': '", "",
-                            choices=self.strategies())
+                            "replication = {'class': 'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication", " = {'class': 'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication=", " {'class': 'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication={", "'class':'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication={'class'", ":'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication={'class': ", "'NetworkTopologyStrategy', ")
+        self.trycompletions("create keyspace moo with replication={'class': '", "NetworkTopologyStrategy")
+        self.trycompletions("create keyspace moo with replication={'class': 'N", "etworkTopologyStrategy'")
+        self.trycompletions("create keyspace moo with replication={'class': 'S", "impleStrategy'")
         # ttl is an "unreserved keyword". should work
         self.trycompletions("create keySPACE ttl with replication ="
                             "{ 'class' : 'SimpleStrategy'", ", 'replication_factor': ")
@@ -555,19 +582,24 @@ class TestCqlshCompletion(CqlshCompletionCase):
         self.trycompletions('DROP ',
                             choices=['AGGREGATE', 'COLUMNFAMILY', 'FUNCTION',
                                      'INDEX', 'KEYSPACE', 'ROLE', 'TABLE',
-                                     'TRIGGER', 'TYPE', 'USER', 'MATERIALIZED'])
+                                     'TRIGGER', 'TYPE', 'USER', 'MATERIALIZED', 'SERVICE_LEVEL'])
 
     def test_complete_in_drop_keyspace(self):
         self.trycompletions('DROP K', immediate='EYSPACE ')
         quoted_keyspace = '"' + self.cqlsh.keyspace + '"'
         self.trycompletions('DROP KEYSPACE ',
-                            choices=['IF', self.cqlsh.keyspace])
+                            choices=['IF', self.cqlsh.keyspace] + self._extra_keyspaces())
 
         self.trycompletions('DROP KEYSPACE ' + quoted_keyspace,
                             choices=[';'])
 
-        self.trycompletions('DROP KEYSPACE I',
-                            immediate='F EXISTS ' + self.cqlsh.keyspace + ' ;')
+        if self._extra_keyspaces():
+            # With the audit keyspace present, there are multiple keyspaces
+            # after IF EXISTS so it can't auto-complete the full thing
+            self.trycompletions('DROP KEYSPACE I', immediate='F EXISTS ')
+        else:
+            self.trycompletions('DROP KEYSPACE I',
+                                immediate='F EXISTS ' + self.cqlsh.keyspace + ' ;')
 
     def create_columnfamily_table_template(self, name):
         """Parameterized test for CREATE COLUMNFAMILY and CREATE TABLE. Since
@@ -576,11 +608,11 @@ class TestCqlshCompletion(CqlshCompletionCase):
         prefix = 'CREATE ' + name + ' '
         quoted_keyspace = '"' + self.cqlsh.keyspace + '"'
         self.trycompletions(prefix + '',
-                            choices=['IF', self.cqlsh.keyspace, '<new_table_name>'])
+                            choices=['IF', self.cqlsh.keyspace, '<new_table_name>'] + self._extra_keyspaces())
         self.trycompletions(prefix + 'IF ',
                             immediate='NOT EXISTS ')
         self.trycompletions(prefix + 'IF NOT EXISTS ',
-                            choices=['<new_table_name>', self.cqlsh.keyspace])
+                            choices=['<new_table_name>', self.cqlsh.keyspace] + self._extra_keyspaces())
         self.trycompletions(prefix + 'IF NOT EXISTS new_table ',
                             immediate='( ')
 
@@ -726,7 +758,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                      'system_traces.', 'songs',
                                      'system_distributed.',
                                      self.cqlsh.keyspace + '.'] +
-                                     (['system_distributed_everywhere.'] if self.is_scylla else []),
+                                     [name + '.' for name in
+                                      self._optional_scylla_keyspaces('system_distributed_everywhere')],
                             other_choices_ok=True)
 
         self.trycompletions('DESC TYPE ',
@@ -825,30 +858,30 @@ class TestCqlshCompletion(CqlshCompletionCase):
     # TODO: CASSANDRA-16640
     # def test_complete_in_drop_columnfamily(self):
     #     pass
-    #
+    
     # def test_complete_in_truncate(self):
     #     pass
-    #
+    
     # def test_complete_in_alter_columnfamily(self):
     #     pass
-    #
+    
     # def test_complete_in_use(self):
     #     pass
-    #
+    
     # def test_complete_in_create_index(self):
     #     pass
-    #
+    
     # def test_complete_in_drop_index(self):
     #     pass
 
     def test_complete_in_alter_keyspace(self):
         self.trycompletions('ALTER KEY', 'SPACE ')
         self.trycompletions('ALTER KEYSPACE ', '', choices=[self.cqlsh.keyspace, 'system_auth',
-                                                            'system_distributed', 'system_traces', 'IF'])
+                                                            'system_distributed', 'system_traces', 'IF'
+                                                            ] + self._extra_keyspaces())
         self.trycompletions('ALTER KEYSPACE I', immediate='F EXISTS ')
-        self.trycompletions('ALTER KEYSPACE system_trac', "es WITH replication = {'class': '")
-        self.trycompletions("ALTER KEYSPACE system_traces WITH replication = {'class': '", '',
-                            choices=['NetworkTopologyStrategy', 'SimpleStrategy'])
+        self.trycompletions('ALTER KEYSPACE system_trac', "es WITH replication = {'class': 'NetworkTopologyStrategy', ")
+        self.trycompletions("ALTER KEYSPACE system_traces WITH replication = {'class': '", 'NetworkTopologyStrategy')
 
     def test_complete_in_grant(self):
         self.trycompletions("GR",
@@ -927,9 +960,8 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                                      'utf8_with_special_chars',
                                                      'system_traces.', 'songs',
                                                      'system_schema.', 'system_distributed.',
-                                                     self.cqlsh.keyspace + '.'] +
-                                                     (['system_distributed_everywhere.'] if self.is_scylla else
-                                                      ['system_views.', 'system_virtual_schema.']))
+                                                     self.cqlsh.keyspace + '.'] + self._system_keyspaces()
+                                                     )
         self.trycompletions('ALTER TABLE IF EXISTS new_table ADD ', choices=['<new_column_name>', 'IF'])
         self.trycompletions('ALTER TABLE IF EXISTS new_table ADD IF NOT EXISTS ', choices=['<new_column_name>'])
         self.trycompletions('ALTER TABLE new_table ADD IF NOT EXISTS ', choices=['<new_column_name>'])
@@ -943,8 +975,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
                                                     'tags', 'system_traces.', 'system_distributed.',
                                                     'phone_number', 'band_info_type', 'address', 'system.', 'system_schema.',
                                                     'system_auth.', self.cqlsh.keyspace + '.'
-                                                    ] + (['system_distributed_everywhere.'] if self.is_scylla else
-                                                        ['system_views.', 'system_virtual_schema.']))
+                                                    ] + self._system_keyspaces())
         self.trycompletions('ALTER TYPE IF EXISTS new_type ADD ', choices=['<new_field_name>', 'IF'])
         self.trycompletions('ALTER TYPE IF EXISTS new_type ADD IF NOT EXISTS ', choices=['<new_field_name>'])
         self.trycompletions('ALTER TYPE IF EXISTS new_type RENAME ', choices=['IF', '<quotedName>', '<identifier>'])
@@ -954,3 +985,35 @@ class TestCqlshCompletion(CqlshCompletionCase):
 
     def test_complete_in_alter_role(self):
         self.trycompletions('ALTER ROLE ', choices=['<identifier>', 'IF', '<quotedName>'])
+
+    def test_complete_in_alter_service_level(self):
+        self.trycompletions('ALTER SERVICE_LEVEL ', choices=['<identifier>', 'IF', '<quotedName>'])
+
+    def test_complete_in_create_service_level(self):
+        self.trycompletions('CREATE SERVICE_LEVEL "sla" WITH ',
+                            choices=['WORKLOAD_TYPE', 'TIMEOUT', 'SHARES'])
+
+    def test_complete_in_attach_service_level(self):
+        self.trycompletions('ATTACH ',
+                            immediate="SERVICE_LEVEL ")
+        self.trycompletions('ATTACH SERVICE_LEVEL "sla" ',
+                            immediate="TO ")
+        self.trycompletions('ATTACH SERVICE_LEVEL "sla" TO ',
+                            choices=['<identifier>', '<quotedName>'])
+
+    def test_complete_in_list_service_levels(self):
+
+        self.trycompletions("LIST ALL ",
+                            choices={'ON', 'NORECURSIVE', 'OF', 'ATTACHED', ';', 'SERVICE_LEVELS', 'PERMISSIONS'})
+
+        self.trycompletions("LIST ALL SERVICE_LEVELS ",
+                            choices={';'})
+
+        self.trycompletions("LIST ALL ATTACHED ",
+                            immediate='SERVICE_LEVELS ;')
+
+        self.trycompletions("LIST ATTACHED  ",
+                            immediate='SERVICE_LEVEL OF ')
+
+        self.trycompletions("LIST SERVICE_LEVEL  ",
+                            choices={'<quotedName>', '<identifier>'})

@@ -51,13 +51,23 @@ def ssl_settings(host, config_file, env=os.environ):
     def get_best_tls_protocol(ssl_ver_str):
         if ssl_ver_str:
             print("Warning: Explicit SSL and TLS versions in the cqlshrc file or in SSL_VERSION environment property are ignored as the protocol is auto-negotiated.\n")
-        return ssl.PROTOCOL_TLS
+        return ssl.PROTOCOL_TLS_CLIENT
 
     ssl_validate = env.get('SSL_VALIDATE')
     if ssl_validate is None:
         ssl_validate = get_option('ssl', 'validate')
     ssl_validate = ssl_validate is None or ssl_validate.lower() != 'false'
 
+    ssl_check_hostname = env.get('SSL_CHECK_HOSTNAME')
+    if ssl_check_hostname is None:
+        ssl_check_hostname = get_option('ssl', 'check_hostname')
+    ssl_check_hostname = ssl_check_hostname is not None and ssl_check_hostname.lower() != 'false'
+
+    if ssl_check_hostname and not ssl_validate:
+        sys.exit("SSL certificate hostname checking "
+                 "(`check_hostname` in the [ssl] section) must be turned off "
+                 "if certificate `validate` is turned off.")
+        
     ssl_version_str = env.get('SSL_VERSION')
     if ssl_version_str is None:
         ssl_version_str = get_option('ssl', 'version')
@@ -84,7 +94,16 @@ def ssl_settings(host, config_file, env=os.environ):
     if usercert:
         usercert = os.path.expanduser(usercert)
 
-    return dict(ca_certs=ssl_certfile,
-                cert_reqs=ssl.CERT_REQUIRED if ssl_validate else ssl.CERT_NONE,
-                ssl_version=ssl_version,
-                keyfile=userkey, certfile=usercert)
+    ssl_context = ssl.SSLContext(ssl_version)
+    ssl_context.check_hostname = ssl_check_hostname
+    if usercert and userkey:
+        ssl_context.load_cert_chain(certfile=usercert,
+                                    keyfile=userkey)
+    if (usercert and not userkey) or (userkey and not usercert):
+        print("Warning: userkey and usercert from [ssl] section, should be both configured, otherwise won't be used")
+
+    ssl_context.verify_mode = ssl.CERT_REQUIRED if ssl_validate else ssl.CERT_NONE
+    if ssl_certfile:
+        ssl_context.load_verify_locations(cafile=ssl_certfile)
+
+    return ssl_context

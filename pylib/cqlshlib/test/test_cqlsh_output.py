@@ -36,6 +36,47 @@ from .ansi_colors import (ColoredText, ansi_seq, lookup_colorcode,
 CONTROL_C = '\x03'
 CONTROL_D = '\x04'
 
+def _normalize_response(response):
+    def should_keep(line):
+        if not line.strip():
+            return False
+        deprecated_options = ["dclocal_read_repair_chance", "read_repair_chance"]
+        for col in deprecated_options:
+            if col in line:
+                return False
+        ignore_options = ["paxos_grace_seconds", "tombstone_gc", "cdc",
+                          "allow_auto_snapshot", "incremental_backups", # cassandra 5.0 one we don't care about
+                          "compression", "expired_sstable_check_frequency_seconds" # ScyllaDB version-specific fields
+                          ]
+        for col in ignore_options:
+            if col in line:
+                return False
+        return True
+
+    def normalize(line):
+        # normalize 0.0, 1.0 etc to 0, 1 etc.
+        line = re.sub(r"\b(\d+)\.0\b", r"\1", line)
+        # replace multiple whitespaces with a single whitespace
+        line = re.sub(r"\s+", " ", line)
+
+        line = line.rstrip(";,:")
+
+        # enforce formatting without whitespace in {ks}.{table} ({col}) and then listing items
+        line = re.sub(r"(\w+\.\w+)\s\(", r"\1(", line)
+        line = re.sub(r",\s+'", ",'", line)
+        if " PRIMARY KEY" in line:
+            return {line.replace(" PRIMARY KEY", ""), f"PRIMARY KEY ({line.split()[0]})"}
+        if ":" in line:
+            return set(line.split(":"))
+        return {line}
+
+    resp = set()
+    for s in response.split("\n"):
+        if should_keep(s):
+            resp.update(normalize(s.strip()))
+
+    return resp
+
 
 class TestCqlshOutput(BaseTestCase):
     @classmethod
@@ -57,6 +98,16 @@ class TestCqlshOutput(BaseTestCase):
                 cls.is_scylla = len(output.all()) == 1
             except InvalidRequest:
                 cls.is_scylla = False
+            try:
+                result = curs.execute("SELECT version FROM system.versions WHERE key = 'local' LIMIT 1")
+                cls.scylla_version = Version(result.one().version.rsplit('.', 2)[0])
+                cls.is_scylla_enterprise = cls.scylla_version > Version('2018.1')
+            except InvalidRequest:
+                cls.is_scylla_enterprise = False
+
+    @property
+    def default_compaction_strategy(self):
+        return 'IncrementalCompactionStrategy' if self.is_scylla_enterprise else 'SizeTieredCompactionStrategy'
 
     def setUp(self):
         env = os.environ.copy()
@@ -684,7 +735,7 @@ class TestCqlshOutput(BaseTestCase):
                 AND read_repair = 'BLOCKING'
                 AND speculative_retry = '99p';""" % quote_name(get_keyspace()))
 
-        scylla_table_desc = dedent("""
+        scylla_table_desc = dedent(f"""
             CREATE TABLE %s.has_all_types (
                 num int PRIMARY KEY,
                 asciicol ascii,
@@ -703,10 +754,10 @@ class TestCqlshOutput(BaseTestCase):
                 varcharcol text,
                 varintcol varint
             ) WITH bloom_filter_fp_chance = 0.01
-                AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+                AND caching = {{'keys': 'ALL', 'rows_per_partition': 'ALL'}}
                 AND comment = ''
-                AND compaction = {'class': 'SizeTieredCompactionStrategy'}
-                AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
+                AND compaction = {{'class': '{self.default_compaction_strategy}'}}
+                AND compression = {{'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}}
                 AND crc_check_chance = 1.0
                 AND dclocal_read_repair_chance = 0.0
                 AND default_time_to_live = 0
@@ -726,7 +777,7 @@ class TestCqlshOutput(BaseTestCase):
                 for semicolon in (';', ''):
                     output = c.cmd_and_response('%s has_all_types%s' % (cmdword, semicolon))
                     self.assertNoHasColors(output)
-                    self.assertSequenceEqual(dedent(output).split('\n'), table_desc3.split('\n'))
+                    self.assertSetEqual(_normalize_response(dedent(output)), _normalize_response(table_desc3))
 
     def test_describe_columnfamilies_output(self):
         output_re = r'''
@@ -792,8 +843,9 @@ class TestCqlshOutput(BaseTestCase):
         output_re_client = r'''(?x)
             ^
             \n
-            Cluster: [ ] (?P<clustername> .* ) \n
-            Partitioner: [ ] (?P<partitionername> .* ) \n
+            Cluster: [ ] (?P<clustername> .* )\s?\n
+            Partitioner: [ ] (?P<partitionername> .* )\s?\n
+            Snitch: [ ] (?P<snitchname>.*)\n|^\s*$
             \n
         '''
 
@@ -845,8 +897,7 @@ class TestCqlshOutput(BaseTestCase):
 
             output = c.cmd_and_response('show host;')
             self.assertHasColors(output)
-            self.assertRegex(output, '^Connected to .* at %s:%d$'
-                                             % (re.escape(TEST_HOST), TEST_PORT))
+            self.assertRegex(output, f'^Connected to .* at {re.escape(TEST_HOST)}:{TEST_PORT}$')
 
     def test_eof_prints_newline(self):
         with testrun_cqlsh(tty=True, env=self.default_env) as c:
@@ -977,6 +1028,24 @@ class TestCqlshOutput(BaseTestCase):
             """),
         ))
 
+    def test_vector_output(self):
+        """
+        SELECT must format vectors of every dimension, not only 2, without
+        'Failed to format value' errors (VECTOR-1005).
+        """
+        query = dedent("""
+            CREATE TABLE vectors (k int PRIMARY KEY, v1 vector<float, 1>, v3 vector<float, 3>,
+                                  lv list<frozen<vector<int, 3>>>);
+            INSERT INTO vectors (k, v1, v3, lv) VALUES (1, [0.5], [0.1, 0.2, 0.3], [[1, 2, 3], [4, 5, 6]]);
+            SELECT v1, v3, lv FROM vectors;
+            DROP TABLE vectors;
+        """)
+        output, result = testcall_cqlsh(prompt=None, env=self.default_env,
+                                        tty=False, input=query)
+        self.assertEqual(0, result)
+        self.assertNotIn('Failed to format', output)
+        self.assertIn(' [0.5] | [0.1, 0.2, 0.3] | [[1, 2, 3], [4, 5, 6]]', output)
+
     def test_expanded_output_counts_past_page(self):
         query = "PAGING 5; EXPAND ON; SELECT * FROM twenty_rows_table;"
         output, result = testcall_cqlsh(prompt=None, env=self.default_env,
@@ -999,8 +1068,7 @@ class TestCqlshOutput(BaseTestCase):
         ) WITH bloom_filter_fp_chance = 0.01
             AND caching = {{'keys': 'ALL', 'rows_per_partition': 'ALL'}}
             AND comment = ''
-            AND compaction = {{'class': 'SizeTieredCompactionStrategy'}}
-            AND compression = {{'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}}
+            AND compaction = {{'class': '{self.default_compaction_strategy}'}}
             AND crc_check_chance = 1.0
             AND dclocal_read_repair_chance = 0.0
             AND default_time_to_live = 0
@@ -1010,13 +1078,15 @@ class TestCqlshOutput(BaseTestCase):
             AND min_index_interval = 128
             AND read_repair_chance = 0.0
             AND speculative_retry = '99.0PERCENTILE';
-        
+
         cdc = {{'delta': 'full', 'enabled': 'true', 'postimage': 'false', 'preimage': 'false', 'ttl': '86400'}}
         """)
 
         with testrun_cqlsh(tty=True, env=self.default_env) as c:
 
             output = c.cmd_and_response(f"CREATE TABLE  {qks}.ccc (pkey int,  PRIMARY KEY(pkey))  WITH cdc = {{'enabled': true}};")
-            self.assertEquals(output.strip(),  "")
+            self.assertEqual(output.strip(),  "")
             output = c.cmd_and_response('describe table {}.ccc'.format(qks))
-            self.assertSequenceEqual(dedent(output).split('\n'), expected.split('\n'))
+            lines = _normalize_response(dedent(output))
+            expected_lines = _normalize_response(expected)
+            self.assertTrue(expected_lines.issubset(lines), f"Output lines \n {{{lines}}} \n doesn't contain expected lines\n {{{expected_lines}}}")

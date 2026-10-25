@@ -17,6 +17,15 @@
 from cassandra.metadata import RegisteredTableExtension
 import io
 import struct
+import sys
+
+if sys.platform == 'win32':
+    # The driver defaults to its libev reactor when the extension is built, and on Windows
+    # that crashes the interpreter (0xC0000409) on the first connect. Use asyncio instead,
+    # for every Cluster cqlsh, COPY and the tests create.
+    import cassandra.cluster
+    from cassandra.io.asyncioreactor import AsyncioConnection
+    cassandra.cluster.DefaultConnection = cassandra.cluster.Cluster.connection_class = AsyncioConnection
 
 
 # Add a handler for schema extensions to at least print 
@@ -73,3 +82,18 @@ class ScyllaTagsExt(RegisteredTableExtension):
         mer = MapExtensionReader(ext_blob)
         return "%s = %s" % (ext_key, mer.read_map())
 
+
+# Add a handler for scylla_encryption_options extension to at least print
+# the info when doing "desc <table>".
+#
+# The end result will not be cut-and-paste usable; we'd need to modify the
+# driver for this. But it is something.
+class Encr(RegisteredTableExtension):
+    name = 'scylla_encryption_options'
+
+    @classmethod
+    def after_table_cql(cls, table_meta, ext_key, ext_blob):
+        # For scylla_encryption_options, the blob is actually
+        # a serialized unorderd_map<string, string>.
+        mer = MapExtensionReader(ext_blob)
+        return "%s = %s" % (ext_key, mer.read_map())
