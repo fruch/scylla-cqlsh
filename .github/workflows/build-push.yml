@@ -247,7 +247,7 @@ jobs:
 
       - name: Start Scylla
         run: |
-          docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 1 --memory 1G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
+          docker run -d --name scylla -p 9042:9042 -p 19042:19042 scylladb/scylla:${{ env.SCYLLA_VERSION }} --cluster-name test --smp 2 --memory 2G --overprovisioned 1 --broadcast-rpc-address 127.0.0.1
 
       - name: pytest
         env:

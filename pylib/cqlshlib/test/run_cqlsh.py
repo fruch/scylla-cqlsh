@@ -315,4 +315,6 @@ def call_cqlsh(**kwargs):
     result = c.close()
     if isinstance(output, bytes):
         output = output.decode("utf-8")
+    # Windows text-mode stdout writes \r\n; the tests expect \n
+    output = output.replace('\r\n', '\n')
     return output, result
