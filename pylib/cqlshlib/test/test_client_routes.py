@@ -193,9 +193,9 @@ def test_login_reconnect_preserves_client_routes(cqlsh_module):
     call_kwargs = mock_cluster.call_args[1]
     assert call_kwargs['contact_points'] == contact_points
     assert call_kwargs['client_routes_config'] is client_routes_config
-    assert call_kwargs['execution_profiles'] is shell.profiles
     profile = call_kwargs['execution_profiles'][cqlsh_module.EXEC_PROFILE_DEFAULT]
     assert isinstance(profile.load_balancing_policy, cqlsh_module.RoundRobinPolicy)
+    assert profile.load_balancing_policy is not shell.profiles[cqlsh_module.EXEC_PROFILE_DEFAULT].load_balancing_policy
     mock_cluster.return_value.connect.assert_called_once_with('testks')
     assert shell.conn is mock_cluster.return_value
     assert shell.session is session
@@ -316,7 +316,6 @@ def test_subshell_login_reconnects_with_the_parent_connection_settings(cqlsh_mod
         subshell.do_login(parsed)
 
     call_kwargs = mock_cluster.call_args[1]
-    assert call_kwargs['execution_profiles'] is profiles
     assert call_kwargs['client_routes_config'] is client_routes_config
     assert call_kwargs['contact_points'] == contact_points
     assert call_kwargs['compression'] is False
